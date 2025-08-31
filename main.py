@@ -28,8 +28,7 @@ PROJECT_ID = os.environ.get("PROJECT_ID", "ai-project-26082025")
 REGION = os.environ.get("REGION", "us-central1")
 # --- Конфигурация Pinecone ---
 # Убедитесь, что эти переменные установлены в Cloud Run
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY",
-                                  'pcsk_6VvZq1_3Yq3xee8mSFuEc2DCuuj4AjcajAumdrYDhgbx6MutCUZPr9FA8ucCGAw4v7nu5G')
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 #print("🚀  API KEY...", PINECONE_API_KEY)
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "medical-knowledge")  # Используем имя из примера Pinecone
 
