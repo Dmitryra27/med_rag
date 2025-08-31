@@ -1,0 +1,8 @@
+.idea
+25_med_rug2.iml
+*.xml
+.gitignore
+deploy*
+main_no.py
+test*
+ai*
