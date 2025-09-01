@@ -30,7 +30,7 @@ REGION = os.environ.get("REGION", "us-central1")
 # Убедитесь, что эти переменные установлены в Cloud Run
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 #print("🚀  API KEY...", PINECONE_API_KEY)
-PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "medical-knowledge")  # Используем имя из примера Pinecone
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "med-index")  # Используем имя из примера Pinecone
 
 
 def setup_authentication():
