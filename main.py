@@ -1,22 +1,21 @@
-# main.py для Cloud Run (с Pinecone и Vertex AI)
+# main.py - Исправленный и улучшенный код для Cloud Run
 import os
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.generative_models import GenerativeModel
-import pinecone  # Импортируем Pinecone
-from fastapi import Response
-from google.cloud import storage
-from google.oauth2 import service_account
-import uvicorn
+import pinecone
 from datetime import datetime
-from google.auth import default
-from google.cloud import aiplatform
-from fastapi.middleware.cors import CORSMiddleware
-# Добавьте в начало файла, если еще не импортировано
-import logging
+import traceback # Для детального логирования исключений
+
+# --- Настройка логирования ---
+# В production используйте уровень WARNING или ERROR
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Глобальные переменные для хранения инициализированных клиентов ---
 embedding_model = None
@@ -27,304 +26,251 @@ pinecone_index = None
 PROJECT_ID = os.environ.get("PROJECT_ID", "ai-project-26082025")
 REGION = os.environ.get("REGION", "us-central1")
 # --- Конфигурация Pinecone ---
-# Убедитесь, что эти переменные установлены в Cloud Run
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-#print("🚀  API KEY...", PINECONE_API_KEY)
-PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "med-index")  # Используем имя из примера Pinecone
-
-
-def setup_authentication():
-    """Настройка аутентификации для локальной отладки"""
-    try:
-        # Попробуем получить учетные данные по умолчанию
-        credentials, project = default()
-        print(f"✅ Аутентификация успешна. Проект: {project}")
-
-        # Установим переменные окружения если они не установлены
-        if not os.environ.get('GOOGLE_CLOUD_PROJECT'):
-            os.environ['GOOGLE_CLOUD_PROJECT'] = project or 'ai-project-26082025'
-
-        if not os.environ.get('GOOGLE_CLOUD_REGION'):
-            os.environ['GOOGLE_CLOUD_REGION'] = 'us-central1'
-
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка аутентификации: {e}")
-        print("Попробуйте выполнить: gcloud auth application-default login")
-        return False
-
-
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "med-index") # Убедитесь, что имя правильное
 
 
 # --- Lifespan handler для FastAPI ---
-# Это гарантирует, что инициализация произойдет при старте приложения
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global embedding_model, gemini_model, pinecone_index
     # --- Инициализация при запуске ---
-    print("🚀 Запуск приложения Medical RAG API...")
+    logger.info("🚀 Начало инициализации приложения Medical RAG API...")
 
-    # 1. Инициализация Vertex AI (обязательно до импорта моделей!)
-    # Убедитесь, что PROJECT_ID и REGION установлены правильно и сервисный аккаунт имеет доступ
     try:
-        credentials = service_account.Credentials.from_service_account_file("ai-project-26082025-6a65bc63db88.json")
-        storage_client = storage.Client(credentials=credentials)
-
+        # 1. Инициализация Vertex AI
+        # В Cloud Run аутентификация обычно происходит автоматически через сервисный аккаунт
+        # Не нужно явно указывать файл ключа, если он прикреплен к сервису
+        logger.info(f"🔧 Инициализация Vertex AI: project={PROJECT_ID}, location={REGION}")
         vertexai.init(project=PROJECT_ID, location=REGION)
+        logger.info("✅ Vertex AI инициализирована.")
 
-        print("✅ Vertex AI инициализирована.")
-    except Exception as e:
-        print(f"❌ Ошибка инициализации Vertex AI: {e}")
-        # В production лучше бросить исключение, чтобы сервис не стартовал
-        # raise
-        # Но для демонстрации продолжим
-        pass
-
-    # 2. Инициализация моделей Vertex AI
-    global embedding_model, gemini_model
-    try:
-        # Убедитесь, что модель существует и доступна в вашем регионе
+        # 2. Инициализация моделей Vertex AI
+        logger.info("🧠 Загрузка модели эмбеддингов text-embedding-005...")
         embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-005")
-        # Используем более стабильную и быструю модель для генерации
-        gemini_model = GenerativeModel("gemini-2.5-pro")
-        print("✅ Модели Vertex AI загружены.")
-    except Exception as e:
-        print(f"❌ Ошибка загрузки моделей Vertex AI: {e}")
-        # Критично, без моделей сервис не работает
-        raise
+        logger.info("✅ Модель эмбеддингов загружена.")
 
-    # 3. Инициализация Pinecone
-    global pinecone_index
-    try:
+        logger.info("🧠 Загрузка модели генерации gemini-2.5-pro...")
+        gemini_model = GenerativeModel("gemini-2.5-pro") # Убедитесь, что модель доступна
+        logger.info("✅ Модель генерации загружена.")
+
+        # 3. Инициализация Pinecone
+        logger.info("🔗 Инициализация Pinecone...")
         if not PINECONE_API_KEY:
-            raise ValueError("PINECONE_API_KEY environment variable is not set.")
+            raise ValueError("❌ Переменная окружения PINECONE_API_KEY не установлена!")
         if not PINECONE_INDEX_NAME:
-            raise ValueError("PINECONE_INDEX_NAME environment variable is not set.")
+            raise ValueError("❌ Переменная окружения PINECONE_INDEX_NAME не установлена!")
 
-        # Инициализация Pinecone (новый SDK v5+)
         pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
-        # Подключаемся к индексу
         pinecone_index = pc.Index(PINECONE_INDEX_NAME)
-        # Проверка: получим статистику индекса
+
+        # Проверка подключения и получения статистики
         index_stats = pinecone_index.describe_index_stats()
-        print(
-            f"✅ Pinecone инициализирован. Индекс '{PINECONE_INDEX_NAME}' содержит {index_stats.get('total_vector_count', 0)} векторов.")
+        logger.info(f"✅ Pinecone инициализирован. Индекс '{PINECONE_INDEX_NAME}' содержит {index_stats.get('total_vector_count', 0)} векторов.")
+        logger.info(f"   Размерность векторов: {index_stats.get('dimension', 'N/A')}")
+
     except Exception as e:
-        print(f"❌ Ошибка инициализации Pinecone: {e}")
-        # Критично, без БД сервис не работает
-        raise
+        logger.error(f"💥 Критическая ошибка инициализации: {e}")
+        logger.error(f"   Traceback: {traceback.format_exc()}")
+        # В production можно бросить исключение, чтобы сервис не стартовал
+        # raise
+        # Но для диагностики пусть запустится, но с ошибками
+        embedding_model = None
+        gemini_model = None
+        pinecone_index = None
 
-    print("🟢 Приложение готово к обработке запросов.")
+    logger.info("🟢 Приложение готово к обработке запросов.")
     yield  # Приложение работает
-    # --- Очистка при завершении (если нужна) ---
-    print("🛑 Завершение работы приложения...")
-    # Pinecone SDK не требует явного закрытия
-
+    # --- Очистка при завершении ---
+    logger.info("🛑 Завершение работы приложения...")
 
 # --- Создание приложения FastAPI с lifespan handler ---
-app = FastAPI(lifespan=lifespan, title="Medical RAG API", version="2.0.0-Pinecone")
-
-# Добавьте CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Для разработки разрешаем все origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Разрешаем все методы (GET, POST, OPTIONS и т.д.)
-    allow_headers=["*"],  # Разрешаем все заголовки
-    # В production лучше указать конкретные origins:
-    # allow_origins=["http://localhost:63342", "https://your-domain.com"],
+app = FastAPI(
+    lifespan=lifespan,
+    title="Medical RAG API",
+    version="2.1.0-Pinecone-Fixed",
+    description="Исправленная версия API для медицинского ассистента с RAG"
 )
 
-# --- Эндпоинты API ---
-@app.get("/")
-async def home():
-    """Корневой эндпоинт для проверки состояния сервиса."""
-    # Получаем статистику Pinecone для здоровья
-    try:
-        stats = pinecone_index.describe_index_stats()
-        vector_count = stats.get('total_vector_count', 'N/A')
-    except:
-        vector_count = 'Ошибка получения статистики'
+# --- Middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Для разработки. В production укажите конкретные origins.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    return {
-        "status": "ok",
-        "message": "Medical RAG API Server on Google Cloud Run (Pinecone + Vertex AI)",
-        "version": "2.0.0-Pinecone",
-        "pinecone_vectors": vector_count
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Проверка состояния сервиса"""
-    try:
-        # Проверяем Pinecone - получаем статистику индекса
-        if pinecone_index is not None:
-            stats = pinecone_index.describe_index_stats()
-            pinecone_status = "healthy"
-            vector_count = stats.get('total_vector_count', 0)
-            dimension = stats.get('dimension', 'N/A')
-        else:
-            pinecone_status = "uninitialized"
-            vector_count = 0
-            dimension = 'N/A'
-
-    except Exception as e:
-        pinecone_status = "unhealthy"
-        vector_count = 0
-        dimension = 'N/A'
-        # Логируем ошибку для отладки
-        print(f"Health check - Pinecone error: {e}")
-
-    # Проверяем Vertex AI модели
-    embedding_model_status = "healthy" if embedding_model is not None else "uninitialized"
-    gemini_model_status = "healthy" if gemini_model is not None else "uninitialized"
-
-    return {
-        "status": "healthy" if (
-                    pinecone_status == "healthy" and embedding_model_status == "healthy" and gemini_model_status == "healthy") else "degraded",
-        "components": {
-            "pinecone": {
-                "status": pinecone_status,
-                "vector_count": vector_count,
-                "dimension": dimension
-            },
-            "embedding_model": {
-                "status": embedding_model_status
-            },
-            "gemini_model": {
-                "status": gemini_model_status
-            }
-        },
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-
-
-# Добавьте этот код в ваш main.py
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import logging
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-# Модель данных для запроса
+# --- Модели данных ---
 class QuestionRequest(BaseModel):
     question: str
 
-
-# Модель данных для ответа
 class AnswerResponse(BaseModel):
     question: str
     answer: str
     sources: list[str]
 
+# --- Эндпоинты API ---
+@app.get("/")
+async def home():
+    """Корневой эндпоинт для проверки состояния сервиса."""
+    try:
+        vector_count = 0
+        if pinecone_index:
+            try:
+                stats = pinecone_index.describe_index_stats()
+                vector_count = stats.get('total_vector_count', 'N/A')
+            except Exception as e:
+                logger.warning(f"Не удалось получить статистику Pinecone в /: {e}")
+                vector_count = f"Ошибка: {e}"
+        else:
+            vector_count = "Не инициализирован"
+
+        return {
+            "status": "ok",
+            "message": "Medical RAG API Server on Google Cloud Run (Pinecone + Vertex AI)",
+            "version": "2.1.0-Pinecone-Fixed",
+            "pinecone_vectors": vector_count,
+            "models_initialized": {
+                "embedding_model": embedding_model is not None,
+                "gemini_model": gemini_model is not None,
+                "pinecone_index": pinecone_index is not None
+            }
+        }
+    except Exception as e:
+        logger.error(f"Ошибка в корневом эндпоинте: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """Проверка состояния сервиса."""
+    try:
+        # Проверяем Pinecone
+        pinecone_status = "uninitialized"
+        vector_count = 0
+        dimension = 'N/A'
+        if pinecone_index is not None:
+            try:
+                stats = pinecone_index.describe_index_stats()
+                pinecone_status = "healthy"
+                vector_count = stats.get('total_vector_count', 0)
+                dimension = stats.get('dimension', 'N/A')
+            except Exception as e:
+                pinecone_status = "unhealthy"
+                logger.error(f"Health check - Pinecone error: {e}")
+
+        # Проверяем модели
+        embedding_model_status = "healthy" if embedding_model is not None else "uninitialized"
+        gemini_model_status = "healthy" if gemini_model is not None else "uninitialized"
+
+        overall_status = "healthy"
+        if pinecone_status != "healthy" or embedding_model_status != "healthy" or gemini_model_status != "healthy":
+            overall_status = "degraded"
+            if pinecone_status == "uninitialized" and embedding_model_status == "uninitialized" and gemini_model_status == "uninitialized":
+                overall_status = "uninitialized"
+
+        return {
+            "status": overall_status,
+            "components": {
+                "pinecone": {
+                    "status": pinecone_status,
+                    "vector_count": vector_count,
+                    "dimension": dimension
+                },
+                "embedding_model": {
+                    "status": embedding_model_status
+                },
+                "gemini_model": {
+                    "status": gemini_model_status
+                }
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        logger.error(f"Ошибка в /health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ask", response_model=AnswerResponse)
-async def ask_question(request: QuestionRequest, response: Response):
+async def ask_question(request: QuestionRequest):
     """
-    Эндпоинт для ответа на медицинские вопросы с использованием RAG
+    Эндпоинт для ответа на медицинские вопросы с использованием RAG.
     """
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    question = request.question.strip()
+    logger.info(f"📥 Получен вопрос: {question}")
+
+    # 1. Валидация входных данных
+    if not question:
+        logger.warning("Получен пустой вопрос")
+        raise HTTPException(status_code=400, detail="Вопрос не может быть пустым")
+    if len(question) > 1000:
+        logger.warning(f"Получен слишком длинный вопрос ({len(question)} символов)")
+        raise HTTPException(status_code=400, detail="Вопрос слишком длинный (максимум 1000 символов)")
+
+    # 2. Проверка инициализации компонентов
+    if not embedding_model:
+        logger.error("Модель эмбеддингов не инициализирована")
+        raise HTTPException(status_code=500, detail="Сервис не готов: модель эмбеддингов не загружена")
+    if not gemini_model:
+        logger.error("Модель генерации не инициализирована")
+        raise HTTPException(status_code=500, detail="Сервис не готов: модель генерации не загружена")
+    if not pinecone_index:
+        logger.error("Индекс Pinecone не инициализирован")
+        raise HTTPException(status_code=500, detail="Сервис не готов: база знаний недоступна")
+
     try:
-        question = request.question.strip()
+        # 3. Создание эмбеддинга для вопроса
+        logger.debug("🧠 Создание эмбеддинга для вопроса...")
+        embedding_response = embedding_model.get_embeddings([question])
+        question_embedding = embedding_response[0].values
+        logger.debug(f"   Эмбеддинг создан (размерность: {len(question_embedding)})")
 
-        # Валидация вопроса
-        if not question:
-            raise HTTPException(status_code=400, detail="Вопрос не может быть пустым")
+        # 4. Поиск похожих документов в Pinecone
+        logger.debug("🔍 Поиск в Pinecone...")
+        search_results = pinecone_index.query(
+            vector=question_embedding,
+            top_k=3,
+            include_metadata=True
+        )
+        logger.debug(f"   Поиск завершен. Найдено {len(search_results.matches)} результатов.")
 
-        if len(question) > 1000:
-            raise HTTPException(status_code=400, detail="Вопрос слишком длинный (максимум 1000 символов)")
-
-        logger.info(f"Получен вопрос: {question}")
-
-        # 1. Создание эмбеддинга для вопроса
-        if embedding_model is None:
-            raise HTTPException(status_code=500, detail="Модель эмбеддингов не инициализирована")
-
-        try:
-            embedding_response = embedding_model.get_embeddings([question])
-            question_embedding = embedding_response[0].values
-            logger.info("Эмбеддинг вопроса создан успешно")
-        except Exception as e:
-            logger.error(f"Ошибка создания эмбеддинга: {e}")
-            raise HTTPException(status_code=500, detail=f"Ошибка обработки вопроса: {str(e)}")
-
-        # 2. Поиск похожих документов в Pinecone
-        if pinecone_index is None:
-            raise HTTPException(status_code=500, detail="Индекс Pinecone не инициализирован")
-
-        try:
-            search_results = pinecone_index.query(
-                vector=question_embedding,
-                top_k=3,  # Количество результатов для контекста
-                include_metadata=True
-            )
-            logger.info(f"Поиск в Pinecone завершен, найдено {len(search_results.matches)} результатов")
-        except Exception as e:
-            logger.error(f"Ошибка поиска в Pinecone: {e}")
-            raise HTTPException(status_code=500, detail=f"Ошибка поиска в базе знаний: {str(e)}")
-
-        # 3. Обработка результатов поиска
+        # 5. Обработка результатов поиска
         contexts = []
         sources = []
-
         if search_results.matches:
             for match in search_results.matches:
                 metadata = match.metadata or {}
-                # Извлекаем текст из метаданных (адаптируйте под вашу структуру)
-                text = metadata.get('text') or metadata.get('content') or metadata.get(
-                    'preview') or f"Документ ID: {match.id}"
+                # Адаптируйте ключи под структуру ваших метаданных в Pinecone
+                # Предположим, что текст хранится в поле 'text' или 'content'
+                text = metadata.get('text') or metadata.get('content') or f"Документ ID: {match.id}"
                 contexts.append(text)
-
-                # Извлекаем источник
                 source = metadata.get('source', 'Неизвестный источник')
                 sources.append(source)
         else:
-            # Если ничего не найдено, используем заглушку
-            contexts.append("Извините, но в базе знаний не найдено информации по вашему вопросу.")
+            logger.info("   Ничего не найдено в базе знаний.")
+            contexts.append("Извините, в базе знаний не найдено информации по вашему вопросу.")
             sources.append("База знаний")
 
-        # 4. Генерация ответа с помощью модели Gemini
-        if gemini_model is None:
-            raise HTTPException(status_code=500, detail="Модель генерации не инициализирована")
+        # 6. Генерация ответа с помощью модели Gemini
+        logger.debug("💬 Генерация ответа с помощью Gemini...")
+        context_text = "\n\n".join(contexts)
 
-        try:
-            # Формируем контекст для модели
-            context_text = "\n\n".join(contexts)
+        # Убедитесь, что промпт соответствует ожиданиям модели
+        prompt = f"""
+        Ты — медицинский ассистент. Отвечай на вопрос, опираясь ТОЛЬКО на предоставленный контекст.
+        Отвечай ясно, точно и по существу.
+        Если ответа нет в контексте, скажи: "Я не могу дать медицинскую консультацию на основе предоставленных данных. Обратитесь к врачу."
 
-            # Создаем промпт для модели
-            prompt = f"""
-            Ты — медицинский ассистент. Отвечай на вопрос, опираясь ТОЛЬКО на предоставленный контекст.
-            Отвечай ясно, точно и по существу.
-            Если ответа нет в контексте, скажи: "Я не могу дать медицинскую консультацию на основе предоставленных данных. Обратитесь к врачу."
+        Контекст:
+        {context_text}
 
-            Контекст:
-            {context_text}
+        Вопрос: {question}
+        Ответ:
+        """.strip()
 
-            Вопрос: {question}
-            Ответ:
-            """.strip()
+        gemini_response = gemini_model.generate_content(prompt)
+        answer = gemini_response.text.strip()
+        logger.debug("   Ответ сгенерирован.")
 
-            # Генерируем ответ
-            response = gemini_model.generate_content(prompt)
-            answer = response.text.strip()
-
-            logger.info("Ответ сгенерирован успешно")
-
-        except Exception as e:
-            logger.error(f"Ошибка генерации ответа: {e}")
-            # В случае ошибки генерации возвращаем ответ на основе контекста
-            if contexts and contexts[0] != "Извините, но в базе знаний не найдено информации по вашему вопросу.":
-                answer = "На основе найденной информации: " + contexts[0][:500] + "..."
-            else:
-                answer = "Извините, не удалось сгенерировать ответ. Обратитесь к врачу."
-
-        # 5. Возвращаем ответ
         return AnswerResponse(
             question=question,
             answer=answer,
@@ -332,20 +278,20 @@ async def ask_question(request: QuestionRequest, response: Response):
         )
 
     except HTTPException:
-        # Перебрасываем HTTP исключения как есть
+        # Перебрасываем HTTPException как есть
         raise
     except Exception as e:
-        logger.error(f"Неожиданная ошибка в /ask: {e}")
-        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
+        # Логируем полную трассировку стека для диагностики
+        logger.error(f"💥 Неожиданная ошибка в /ask: {e}")
+        logger.error(f"   Traceback: {traceback.format_exc()}")
+        # Возвращаем 500 с деталями (в production лучше скрыть детали)
+        raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {str(e)}")
 
-
+# --- Запуск сервера ---
 if __name__ == "__main__":
-    if not setup_authentication():
-        exit(1)
     import uvicorn
-
     # Получаем порт из переменной окружения, установленной Cloud Run
     port = int(os.environ.get("PORT", 8080))
-    print(f"Запуск сервера на порту {port}...")
+    logger.info(f"🚀 Запуск сервера Uvicorn на порту {port}...")
     # ВАЖНО: host должен быть "0.0.0.0" для Cloud Run
     uvicorn.run(app, host="0.0.0.0", port=port)
